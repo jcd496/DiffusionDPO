@@ -1,12 +1,12 @@
-accelerate==0.20.2
-diffusers==0.20.0
+accelerate
+diffusers
 torchvision
-transformers==4.30.2
+transformers
 datasets
 ftfy
 tensorboard
 Jinja2
 bitsandbytes
-xformers==0.0.22
+xformers
 hpsv2
 openai_clip==1.0.1
