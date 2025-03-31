@@ -8,13 +8,13 @@ accelerate launch train.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_NAME \
   --train_batch_size=1 \
-  --dataloader_num_workers=16 \
-  --gradient_accumulation_steps=128 \
-  --max_train_steps=2000 \
+  --dataloader_num_workers=1 \
+  --gradient_accumulation_steps=16 \
+  --max_train_steps=1000 \
   --lr_scheduler="constant_with_warmup" --lr_warmup_steps=500 \
   --learning_rate=1e-8 --scale_lr \
-  --cache_dir="/export/share/datasets/vision_language/pick_a_pic_v2/" \
-  --checkpointing_steps 500 \
+  --cache_dir="/workspace/datasets/vision_language/pick_a_pic_v2/" \
+  --checkpointing_steps 10 \
   --beta_dpo 5000 \
-   --output_dir="tmp-sd15"
+   --output_dir="/workspace/outputs"
 
