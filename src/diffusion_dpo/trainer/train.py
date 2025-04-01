@@ -13,9 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 
-import argparse
 import io
-import logging
 import math
 import os
 import random
@@ -31,36 +29,31 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.state import AcceleratorState
-from accelerate.utils import ProjectConfiguration, set_seed
+
 from datasets import load_dataset
-from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
+from accelerate.logging import get_logger
+from accelerate.state import AcceleratorState
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel,     StableDiffusionXLPipeline
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
+from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 
-
-if is_wandb_available():
-    import wandb
-
-    
     
 ## SDXL
-import functools
-import gc
-from torchvision.transforms.functional import crop
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import AutoTokenizer
 
+from diffusion_dpo.text_encoder.model import import_text_encoder_class_from_name_or_path
+from diffusion_dpo.trainer.trainer_args import parse_args
+from diffusion_dpo.trainer.accelerator import get_accelerator
+from diffusion_dpo.trainer.components import get_system_components
+from diffusion_dpo.diffusion.tooling import deepspeed_zero_init_disabled_context_manager, enforce_zero_terminal_snr
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -74,433 +67,18 @@ DATASET_NAME_MAPPING = {
 }
 
         
-def import_model_class_from_model_name_or_path(
-    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
-):
-    text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
-    )
-    model_class = text_encoder_config.architectures[0]
-
-    if model_class == "CLIPTextModel":
-        from transformers import CLIPTextModel
-
-        return CLIPTextModel
-    elif model_class == "CLIPTextModelWithProjection":
-        from transformers import CLIPTextModelWithProjection
-
-        return CLIPTextModelWithProjection
-    else:
-        raise ValueError(f"{model_class} is not supported.")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
-    )
-    parser.add_argument(
-        "--pretrained_model_name_or_path",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--revision",
-        type=str,
-        default=None,
-        required=False,
-        help="Revision of pretrained model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that 🤗 Datasets can understand."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default="caption",
-        help="The column of the dataset containing a caption or a list of captions.",
-    )
-    parser.add_argument(
-        "--max_train_samples",
-        type=int,
-        default=None,
-        help=(
-            "For debugging purposes or quicker training, truncate the number of training examples to this "
-            "value if set."
-        ),
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="sd-model-finetuned",
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument(
-        "--cache_dir",
-        type=str,
-        default=None,
-        help="The directory where the downloaded models and datasets will be stored.",
-    )
-    parser.add_argument("--seed", type=int, default=None,
-                        # was random for submission, need to test that not distributing same noise etc across devices
-                        help="A seed for reproducible training.")
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=None,
-        help=(
-            "The resolution for input images, all the images in the dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--random_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "If set the images will be randomly"
-            " cropped (instead of center). The images will be resized to the resolution first before cropping."
-        ),
-    )
-    parser.add_argument(
-        "--no_hflip",
-        action="store_true",
-        help="whether to supress horizontal flipping",
-    )
-    parser.add_argument(
-        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
-    )
-    parser.add_argument("--num_train_epochs", type=int, default=100)
-    parser.add_argument(
-        "--max_train_steps",
-        type=int,
-        default=2000,
-        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action="store_true",
-        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-8,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    parser.add_argument(
-        "--scale_lr",
-        action="store_true",
-        default=False,
-        help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
-    )
-    parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        default="constant_with_warmup",
-        help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),
-    )
-    parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
-    )
-    parser.add_argument(
-        "--use_adafactor", action="store_true", help="Whether or not to use adafactor (should save mem)"
-    )
-    # Bram Note: Haven't looked @ this yet
-    parser.add_argument(
-        "--allow_tf32",
-        action="store_true",
-        help=(
-            "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
-            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
-        ),
-    )
-    parser.add_argument(
-        "--dataloader_num_workers",
-        type=int,
-        default=0,
-        help=(
-            "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
-        ),
-    )
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument(
-        "--logging_dir",
-        type=str,
-        default="logs",
-        help=(
-            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
-            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
-        ),
-    )
-    parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        default="fp16",
-        choices=["no", "fp16", "bf16"],
-        help=(
-            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
-            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
-            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
-        ),
-    )
-    parser.add_argument(
-        "--report_to",
-        type=str,
-        default="tensorboard",
-        help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
-            ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
-        ),
-    )
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=500,
-        help=(
-            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
-            " training using `--resume_from_checkpoint`."
-        ),
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default='latest',
-        help=(
-            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
-        ),
-    )
-    parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
-    parser.add_argument(
-        "--tracker_project_name",
-        type=str,
-        default="tuning",
-        help=(
-            "The `project_name` argument passed to Accelerator.init_trackers for"
-            " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
-        ),
-    )
-
-    ## SDXL
-    parser.add_argument(
-        "--pretrained_vae_model_name_or_path",
-        type=str,
-        default=None,
-        help="Path to pretrained VAE model with better numerical stability. More details: https://github.com/huggingface/diffusers/pull/4038.",
-    )
-    parser.add_argument("--sdxl", action='store_true', help="Train sdxl")
-    
-    ## DPO
-    parser.add_argument("--sft", action='store_true', help="Run Supervised Fine-Tuning instead of Direct Preference Optimization")
-    parser.add_argument("--beta_dpo", type=float, default=5000, help="The beta DPO temperature controlling strength of KL penalty")
-    parser.add_argument(
-        "--hard_skip_resume", action="store_true", help="Load weights etc. but don't iter through loader for loader resume, useful b/c resume takes forever"
-    )
-    parser.add_argument(
-        "--unet_init", type=str, default='', help="Initialize start of run from unet (not compatible w/ checkpoint load)"
-    )
-    parser.add_argument(
-        "--proportion_empty_prompts",
-        type=float,
-        default=0.2,
-        help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).",
-    )
-    parser.add_argument(
-        "--split", type=str, default='train', help="Datasplit"
-    )
-    parser.add_argument(
-        "--choice_model", type=str, default='', help="Model to use for ranking (override dataset PS label_0/1). choices: aes, clip, hps, pickscore"
-    )
-    parser.add_argument(
-        "--dreamlike_pairs_only", action="store_true", help="Only train on pairs where both generations are from dreamlike"
-    )
-    
-    args = parser.parse_args()
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
-
-    ## SDXL
-    if args.sdxl:
-        print("Running SDXL")
-    if args.resolution is None:
-        if args.sdxl:
-            args.resolution = 1024
-        else:
-            args.resolution = 512
-            
-    args.train_method = 'sft' if args.sft else 'dpo'
-    return args
-
-
-# Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
-def encode_prompt_sdxl(batch, text_encoders, tokenizers, proportion_empty_prompts, caption_column, is_train=True):
-    prompt_embeds_list = []
-    prompt_batch = batch[caption_column]
-
-    captions = []
-    for caption in prompt_batch:
-        if random.random() < proportion_empty_prompts:
-            captions.append("")
-        elif isinstance(caption, str):
-            captions.append(caption)
-        elif isinstance(caption, (list, np.ndarray)):
-            # take a random caption if there are multiple
-            captions.append(random.choice(caption) if is_train else caption[0])
-
-    with torch.no_grad():
-        for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-            text_inputs = tokenizer(
-                captions,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_input_ids = text_inputs.input_ids
-            prompt_embeds = text_encoder(
-                text_input_ids.to('cuda'),
-                output_hidden_states=True,
-            )
-
-            # We are only ALWAYS interested in the pooled output of the final text encoder
-            pooled_prompt_embeds = prompt_embeds[0]
-            prompt_embeds = prompt_embeds.hidden_states[-2]
-            bs_embed, seq_len, _ = prompt_embeds.shape
-            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-            prompt_embeds_list.append(prompt_embeds)
-
-    prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-    pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
-    return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
-
-
-
-
 def main():
     
     args = parse_args()
     
-    #### START ACCELERATOR BOILERPLATE ###
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
-
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
-        project_config=accelerator_project_config,
-    )
-
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
-        diffusers.utils.logging.set_verbosity_error()
-
-    # If passed along, set the training seed now.
-    if args.seed is not None:
-        set_seed(args.seed + accelerator.process_index) # added in + term, untested
-
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
-    ### END ACCELERATOR BOILERPLATE
+    accelerator = get_accelerator(args)
     
     
     ### START DIFFUSION BOILERPLATE ###
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, 
                                                     subfolder="scheduler")
-    def enforce_zero_terminal_snr(scheduler):
-        # Modified from https://arxiv.org/pdf/2305.08891.pdf
-        # Turbo needs zero terminal SNR to truly learn from noise
-        # Turbo: https://static1.squarespace.com/static/6213c340453c3f502425776e/t/65663480a92fba51d0e1023f/1701197769659/adversarial_diffusion_distillation.pdf
-        # Convert betas to alphas_bar_sqrt
-        alphas = 1 - scheduler.betas
-        alphas_bar = alphas.cumprod(0)
-        alphas_bar_sqrt = alphas_bar.sqrt()
-
-        # Store old values.
-        alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
-        alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
-        # Shift so last timestep is zero.
-        alphas_bar_sqrt -= alphas_bar_sqrt_T
-        # Scale so first timestep is back to old value.
-        alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
-
-        alphas_bar = alphas_bar_sqrt ** 2
-        alphas = alphas_bar[1:] / alphas_bar[:-1]
-        alphas = torch.cat([alphas_bar[0:1], alphas])
     
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        scheduler.alphas_cumprod = alphas_cumprod
-        return 
     if 'turbo' in args.pretrained_model_name_or_path:
         enforce_zero_terminal_snr(noise_scheduler)
     
@@ -523,95 +101,31 @@ def main():
         )
 
     # Not sure if we're hitting this at all
-    def deepspeed_zero_init_disabled_context_manager():
-        """
-        returns either a context list that includes one that will disable zero.Init or an empty context list
-        """
-        deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
-        if deepspeed_plugin is None:
-            return []
-
-        return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
+    
 
     
     # BRAM NOTE: We're not using deepspeed currently so not sure it'll work. Could be good to add though!
     # 
-    # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
-    # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
-    # will try to assign the same optimizer with the same weights to all models during
-    # `deepspeed.initialize`, which of course doesn't work.
-    #
-    # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
-    # frozen models from being partitioned during `zero.Init` which gets called during
-    # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
-    # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
-    with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-        # SDXL has two text encoders
-        if args.sdxl:
-            # import correct text encoder classes
-            text_encoder_cls_one = import_model_class_from_model_name_or_path(
-               tokenizer_and_encoder_name, args.revision
-            )
-            text_encoder_cls_two = import_model_class_from_model_name_or_path(
-                tokenizer_and_encoder_name, args.revision, subfolder="text_encoder_2"
-            )
-            text_encoder_one = text_encoder_cls_one.from_pretrained(
-                tokenizer_and_encoder_name, subfolder="text_encoder", revision=args.revision
-            )
-            text_encoder_two = text_encoder_cls_two.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision
-            )
-            if args.pretrained_model_name_or_path=="stabilityai/stable-diffusion-xl-refiner-1.0":
-                text_encoders = [text_encoder_two]
-                tokenizers = [tokenizer_two]
-            else:
-                text_encoders = [text_encoder_one, text_encoder_two]
-                tokenizers = [tokenizer_one, tokenizer_two]
-        else:
-            text_encoder = CLIPTextModel.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
-            )
-        # Can custom-select VAE (used in original SDXL tuning)
-        vae_path = (
-            args.pretrained_model_name_or_path
-            if args.pretrained_vae_model_name_or_path is None
-            else args.pretrained_vae_model_name_or_path
-        )
-        vae = AutoencoderKL.from_pretrained(
-            vae_path, subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None, revision=args.revision
-        )
-        # clone of model
-        ref_unet = UNet2DConditionModel.from_pretrained(
-            args.unet_init if args.unet_init else args.pretrained_model_name_or_path,
-            subfolder="unet", revision=args.revision
-        )
-    if args.unet_init:
-        print("Initializing unet from", args.unet_init)
-    unet = UNet2DConditionModel.from_pretrained(
-        args.unet_init if args.unet_init else args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+    # Initialize system components
+    components = get_system_components(
+        args,
+        tokenizer_one=tokenizer_one if args.sdxl else None,
+        tokenizer_two=tokenizer_two if args.sdxl else None,
+        tokenizer_and_encoder_name=tokenizer_and_encoder_name if args.sdxl else None
     )
-
-    # Freeze vae, text_encoder(s), reference unet
-    vae.requires_grad_(False)
+    
+    # Extract components
     if args.sdxl:
-        text_encoder_one.requires_grad_(False)
-        text_encoder_two.requires_grad_(False)
+        text_encoders = components["text_encoders"]
+        tokenizers = components["tokenizers"]
+        text_encoder_one = text_encoders[0]
+        text_encoder_two = text_encoders[1] if len(text_encoders) > 1 else None
     else:
-        text_encoder.requires_grad_(False)
-    if args.train_method == 'dpo': ref_unet.requires_grad_(False)
-
-    # xformers efficient attention
-    if is_xformers_available():
-        import xformers
-
-        xformers_version = version.parse(xformers.__version__)
-        if xformers_version == version.parse("0.0.16"):
-            logger.warn(
-                "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-            )
-        unet.enable_xformers_memory_efficient_attention()
-    else:
-        raise ValueError("xformers is not available. Make sure it is installed correctly")
+        text_encoder = components["text_encoder"]
+    
+    vae = components["vae"]
+    unet = components["unet"]
+    ref_unet = components["ref_unet"]
 
     # BRAM NOTE: We're using >=0.16.0. Below was a bit of a bug hive. I hacked around it, but ideally ref_unet wouldn't
     # be getting passed here

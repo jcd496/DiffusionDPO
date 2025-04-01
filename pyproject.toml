@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools_scm]
+
+[project]
+name = "diffusion_dpo"
+dynamic = ["version"]
+description = "Implementation of DPO for Stable Diffusion"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate",
+    "diffusers",
+    "torchvision",
+    "transformers",
+    "datasets",
+    "ftfy",
+    "tensorboard",
+    "Jinja2",
+    "bitsandbytes",
+    "xformers",
+    "hpsv2",
+    "openai_clip==1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "isort",
+    "flake8",
+    "pytest",
+]
